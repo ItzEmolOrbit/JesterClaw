@@ -3,12 +3,14 @@ JesterClaw — Main Server Entry Point (Linux / Ubuntu GPU Server)
 Team Lapanic / EmolOrbit
 
 Architecture:
-  SERVER (this, Linux) → runs Qwen2.5-Omni-3B, infers, dispatches action JSON
+  SERVER (this, Linux) → runs Qwen2.5-Omni-3B Q4_K_M GGUF via llama.cpp
+                         infers text, dispatches action JSON to client
   CLIENT (Windows)     → executes actions (pyautogui, playwright, mss, etc.)
+                         handles voice input (STT) locally
 
 Endpoints:
-  GET  /health  → system status + VRAM
-  WS   /agent   → full-duplex agent loop (text / audio / vision / actions)
+  GET /health  → server + model status
+  WS  /agent   → full-duplex text agent loop
 """
 
 import os
@@ -19,7 +21,7 @@ from fastapi import FastAPI, WebSocket, Depends, HTTPException, Header
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from model_loader import load_model, vram_stats
+from model_loader import load_model, model_info
 from modules.session_manager import SessionManager
 from Routes.agent_route import agent_websocket_handler
 from Routes.health_route import health_router
@@ -34,18 +36,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jesterclaw")
 
-# ── Config (override via environment variables) ────────────────────────────────
-HOST          = os.getenv("JESTERCLAW_HOST", "0.0.0.0")
-PORT          = int(os.getenv("JESTERCLAW_PORT", "3839"))
-SECRET_TOKEN  = os.getenv("JESTERCLAW_TOKEN", "jesterclaw-secret-change-me")
+# ── Config ─────────────────────────────────────────────────────────────────────
+HOST         = os.getenv("JESTERCLAW_HOST", "0.0.0.0")
+PORT         = int(os.getenv("JESTERCLAW_PORT", "3839"))
+SECRET_TOKEN = os.getenv("JESTERCLAW_TOKEN", "jesterclaw-secret-change-me")
 
-# ── Session manager (shared across routes) ─────────────────────────────────────
+# ── Shared session manager ─────────────────────────────────────────────────────
 session_manager = SessionManager()
 
-# ── App lifecycle ──────────────────────────────────────────────────────────────
+# ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- Startup ---
     print(r"""
      ___          _                  _____ _
     |_  |        | |                /  __ \ |
@@ -55,64 +56,47 @@ async def lifespan(app: FastAPI):
   \____/ \___|\__,_|_|  \___/| .__/  \____/_|\__,_| \_/\_/
                               | |
                               |_|   Team Lapanic / EmolOrbit
+         Backend: Qwen2.5-Omni-3B Q4_K_M (llama.cpp GGUF)
     """)
+
     logger.info("JesterClaw server starting on %s:%d", HOST, PORT)
 
-    # Safety pre-check
     if not is_server_safe_to_start():
-        logger.critical("Safety pre-check failed. Aborting startup.")
         raise RuntimeError("Safety pre-check failed.")
 
-    # Load model into GPU memory once
-    logger.info("Loading Qwen2.5-Omni-3B into GPU memory (this may take ~30s)...")
+    logger.info("Loading GGUF model via llama.cpp...")
     load_model()
-    logger.info("Model ready. JesterClaw is live.")
+    logger.info("Model ready. JesterClaw is live on port %d.", PORT)
 
-    yield  # ← server is running
+    yield
 
-    # --- Shutdown ---
-    logger.info("Shutting down JesterClaw. Goodbye.")
+    logger.info("Shutting down JesterClaw.")
     await session_manager.close_all()
 
 
-# ── FastAPI app ────────────────────────────────────────────────────────────────
+# ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="JesterClaw",
     description="Windows AI Agent — Team Lapanic / EmolOrbit",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url=None,
 )
 
-# ── Auth helper ────────────────────────────────────────────────────────────────
-def verify_token(x_jesterclaw_token: str = Header(default="")):
-    if x_jesterclaw_token != SECRET_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid or missing JesterClaw token.")
-
-
-# ── Include routers ────────────────────────────────────────────────────────────
 app.include_router(health_router)
-app.include_router(screenshot_router, dependencies=[Depends(verify_token)])
+app.include_router(screenshot_router)
 
 
-# ── WebSocket endpoint ─────────────────────────────────────────────────────────
+# ── WebSocket auth ─────────────────────────────────────────────────────────────
 @app.websocket("/agent")
-async def agent_endpoint(
-    websocket: WebSocket,
-    token: str = "",          # passed as query param: ws://IP:3839/agent?token=...
-):
-    # Token auth via query param for WebSocket (headers are tricky across clients)
+async def agent_endpoint(websocket: WebSocket, token: str = ""):
     if token != SECRET_TOKEN:
         await websocket.close(code=4003, reason="Invalid token")
         return
-
     await agent_websocket_handler(websocket, session_manager)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    logger.info("Starting JesterClaw on %s:%d", HOST, PORT)
     uvicorn.run(
         "Main:app",
         host=HOST,
