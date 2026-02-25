@@ -24,18 +24,15 @@ SERVER → CLIENT:
 """
 
 import json
-import base64
 import logging
 import asyncio
-import tempfile
-import os
 from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from modules.inference_engine import stream_inference, extract_actions
 from modules.session_manager import SessionManager
-from modules.audio_processor import base64_to_bytes, save_to_temp, cleanup_temp
+from modules.audio_processor import cleanup_temp
 from Safety_Check.safety_filter import check_action_safety
 from Safety_Check.command_validator import validate_command, requires_confirmation
 from Database.session_db import register_session, close_session, log_action
@@ -91,8 +88,8 @@ async def agent_websocket_handler(websocket: WebSocket, session_manager: Session
                 continue
 
             # ── Input parsing ──────────────────────────────────────────────────
-            user_text  = None
-            image_b64  = None
+            user_text = None
+            image_b64 = None
 
             if msg_type == "text":
                 user_text = str(msg.get("data", "")).strip()
