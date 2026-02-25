@@ -1,11 +1,17 @@
 # JesterClaw Server — Python Requirements (Linux Ubuntu + CUDA)
 # Team Lapanic / EmolOrbit
 #
-# The server ONLY runs the AI model.
-# Windows automation is handled by the client.
+# Backend: llama.cpp GGUF (via llama-cpp-python)
+# STT: faster-whisper (voice input → text)
+# NO TTS — text output only
 #
-# Install: pip install -r requirements.txt
-# Then:    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch CUDA for Whisper:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# Install llama-cpp-python with CUDA:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir
+#
+# Or just run: bash dependency_installer.bash
 
 # Web framework
 fastapi>=0.110.0
@@ -13,22 +19,22 @@ uvicorn[standard]>=0.29.0
 websockets
 python-multipart
 
-# ML stack (install PyTorch with CUDA separately — see above)
-transformers>=4.51.0
-accelerate
-sentencepiece
-tokenizers
+# GGUF inference (llama.cpp Python bindings)
+# Installed separately with CUDA flag — see dependency_installer.bash
+# llama-cpp-python
 
-# Qwen Omni
-qwen-omni-utils
+# HuggingFace hub (download only)
+huggingface_hub
 
-# Audio (TTS + STT processing on server)
+# STT (voice → text on server)
+faster-whisper
+
+# Audio
 soundfile
-librosa
 numpy
 scipy
 
-# Image processing (received from client)
+# Image (screenshots from client)
 Pillow
 
 # Utilities
