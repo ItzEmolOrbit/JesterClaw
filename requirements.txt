@@ -1,0 +1,39 @@
+# JesterClaw Server — Python Requirements (Linux Ubuntu + CUDA)
+# Team Lapanic / EmolOrbit
+#
+# The server ONLY runs the AI model.
+# Windows automation is handled by the client.
+#
+# Install: pip install -r requirements.txt
+# Then:    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Web framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+websockets
+python-multipart
+
+# ML stack (install PyTorch with CUDA separately — see above)
+transformers>=4.51.0
+accelerate
+sentencepiece
+tokenizers
+
+# Qwen Omni
+qwen-omni-utils
+
+# Audio (TTS + STT processing on server)
+soundfile
+librosa
+numpy
+scipy
+
+# Image processing (received from client)
+Pillow
+
+# Utilities
+psutil
+python-dotenv
+aiofiles
+httpx
+rich
