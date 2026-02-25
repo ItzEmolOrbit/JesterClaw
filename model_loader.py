@@ -1,93 +1,94 @@
 """
-JesterClaw — Model Loader
+JesterClaw — Model Loader (llama-cpp-python GGUF)
 Team Lapanic / EmolOrbit
 
-Singleton loader for Qwen2.5-Omni-3B.
-Import get_model() and get_processor() anywhere in the server.
+Loads yuhong123/Qwen2.5-Omni-3B-Q4_K_M-GGUF using llama-cpp-python.
+Text-only inference. No TTS. Voice input is handled client-side.
+
+Singleton pattern — import get_llm() from anywhere in the server.
 """
 
 import os
 import logging
-import torch
 from pathlib import Path
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+from llama_cpp import Llama
 
 logger = logging.getLogger("jesterclaw.model")
 
-# ── Path resolution ────────────────────────────────────────────────────────────
-_BASE_DIR = Path(__file__).parent
-MODEL_LOCAL_PATH = _BASE_DIR / "Model Files" / "Qwen2.5-Omni-3B"
-MODEL_HF_ID      = "Qwen/Qwen2.5-Omni-3B"
+# ── Paths ──────────────────────────────────────────────────────────────────────
+_BASE_DIR   = Path(__file__).parent
+_MODEL_DIR  = _BASE_DIR / "Model Files"
+_GGUF_FILE  = "qwen2.5-omni-3b-q4_k_m.gguf"
+_GGUF_PATH  = _MODEL_DIR / _GGUF_FILE
 
-# Use local path if downloaded, otherwise fall back to HF hub streaming
-MODEL_PATH = str(MODEL_LOCAL_PATH) if MODEL_LOCAL_PATH.exists() else MODEL_HF_ID
+# HuggingFace repo (used if local file not found)
+_HF_REPO    = "yuhong123/Qwen2.5-Omni-3B-Q4_K_M-GGUF"
+_HF_FILE    = _GGUF_FILE
 
-# ── Singletons ─────────────────────────────────────────────────────────────────
-_model: Qwen2_5OmniForConditionalGeneration | None = None
-_processor: Qwen2_5OmniProcessor | None = None
+# ── Config (overridable via env) ───────────────────────────────────────────────
+N_GPU_LAYERS = int(os.getenv("JESTERCLAW_GPU_LAYERS", "-1"))   # -1 = all layers on GPU
+N_CTX        = int(os.getenv("JESTERCLAW_CTX", "4096"))         # context window
+N_THREADS    = int(os.getenv("JESTERCLAW_THREADS", "4"))         # CPU threads (for prefill)
+
+# ── Singleton ──────────────────────────────────────────────────────────────────
+_llm: Llama | None = None
 
 
-def load_model() -> tuple[Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor]:
+def load_model() -> Llama:
     """
-    Load Qwen2.5-Omni-3B into GPU memory.
-    Called once at server startup — subsequent calls are no-ops.
+    Load the GGUF model into GPU memory.
+    Called once at server startup. Subsequent calls are no-ops.
     """
-    global _model, _processor
+    global _llm
 
-    if _model is not None and _processor is not None:
-        return _model, _processor
+    if _llm is not None:
+        return _llm
 
-    logger.info("Loading Qwen2.5-Omni-3B from: %s", MODEL_PATH)
-
-    # Try flash_attention_2 first (requires flash-attn package + Ampere+ GPU)
-    try:
-        _model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-            MODEL_PATH,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            attn_implementation="flash_attention_2",
+    # Prefer local file; fall back to HF hub download
+    if _GGUF_PATH.exists():
+        model_path = str(_GGUF_PATH)
+        logger.info("Loading GGUF from local file: %s", model_path)
+    else:
+        logger.info("Local GGUF not found — downloading from HuggingFace: %s / %s", _HF_REPO, _HF_FILE)
+        from huggingface_hub import hf_hub_download
+        model_path = hf_hub_download(
+            repo_id=_HF_REPO,
+            filename=_HF_FILE,
+            local_dir=str(_MODEL_DIR),
         )
-        logger.info("Loaded with flash_attention_2 ✓")
-    except Exception as flash_err:
-        logger.warning("flash_attention_2 unavailable (%s). Falling back to eager.", flash_err)
-        _model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-            MODEL_PATH,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-        )
-        logger.info("Loaded with eager attention ✓")
+        logger.info("Downloaded to: %s", model_path)
 
-    _processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_PATH)
+    logger.info(
+        "Initialising Llama: ctx=%d  gpu_layers=%s  threads=%d",
+        N_CTX, N_GPU_LAYERS, N_THREADS,
+    )
 
-    # Log VRAM usage
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            used  = torch.cuda.memory_allocated(i) / 1024 ** 3
-            total = torch.cuda.get_device_properties(i).total_memory / 1024 ** 3
-            logger.info("GPU %d: %.2f / %.2f GB VRAM used", i, used, total)
+    _llm = Llama(
+        model_path=model_path,
+        n_ctx=N_CTX,
+        n_gpu_layers=N_GPU_LAYERS,   # -1 offloads everything to GPU
+        n_threads=N_THREADS,
+        verbose=False,               # set True to see llama.cpp logs
+        chat_format="chatml",        # Qwen uses ChatML format
+    )
 
-    logger.info("Qwen2.5-Omni-3B ready.")
-    return _model, _processor
+    logger.info("Qwen2.5-Omni-3B-Q4_K_M loaded and ready.")
+    return _llm
 
 
-def get_model() -> Qwen2_5OmniForConditionalGeneration:
-    if _model is None:
+def get_llm() -> Llama:
+    if _llm is None:
         raise RuntimeError("Model not loaded. Call load_model() first.")
-    return _model
+    return _llm
 
 
-def get_processor() -> Qwen2_5OmniProcessor:
-    if _processor is None:
-        raise RuntimeError("Processor not loaded. Call load_model() first.")
-    return _processor
+def model_info() -> dict:
+    """Return basic model metadata for the /health endpoint."""
+    return {
+        "repo":   _HF_REPO,
+        "file":   _HF_FILE,
+        "ctx":    N_CTX,
+        "gpu_layers": N_GPU_LAYERS,
+        "loaded": _llm is not None,
+    }
 
-
-def vram_stats() -> dict:
-    """Return VRAM usage per GPU as a dict."""
-    stats = {}
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            used  = torch.cuda.memory_allocated(i) / 1024 ** 3
-            total = torch.cuda.get_device_properties(i).total_memory / 1024 ** 3
-            stats[f"gpu{i}"] = {"used_gb": round(used, 2), "total_gb": round(total, 2)}
-    return stats
