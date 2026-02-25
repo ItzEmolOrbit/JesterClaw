@@ -1,63 +1,47 @@
 """
-JesterClaw — Audio Processor
+JesterClaw — Audio Processor (Server Side)
 Team Lapanic / EmolOrbit
 
-Handles audio I/O:
-  - PCM/WAV bytes → temp file for model ingestion
-  - WAV bytes → base64 for WebSocket transmission
+The server receives audio from the Windows client in two ways:
+  1. Client does STT locally → sends plain text (preferred, lowest latency)
+  2. Client sends raw WAV bytes → server decodes and passes to model if it supports audio
+
+Since we use the GGUF text model, voice is handled client-side.
+This module just provides byte-handling utilities for audio received over WebSocket.
 """
 
 import io
-import os
-import uuid
 import base64
 import logging
 import tempfile
-import numpy as np
-import soundfile as sf
+import os
 
 logger = logging.getLogger("jesterclaw.audio")
 
-SAMPLE_RATE = 16000   # model expects 16kHz for audio input
-TTS_RATE    = 24000   # model outputs 24kHz TTS
 
-
-def pcm_bytes_to_wav_file(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> str:
-    """
-    Save raw PCM bytes (16-bit LE mono) to a temp WAV file.
-    Returns file path. Caller is responsible for cleanup.
-    """
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    sf.write(tmp.name, audio_np, samplerate=sample_rate)
-    tmp.close()
-    return tmp.name
-
-
-def wav_bytes_to_temp_file(wav_bytes: bytes) -> str:
-    """
-    Save WAV bytes to a temp file. Returns file path.
-    """
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.write(wav_bytes)
-    tmp.close()
-    return tmp.name
-
-
-def wav_bytes_to_base64(wav_bytes: bytes) -> str:
-    """Encode WAV bytes to base64 string for WebSocket JSON transmission."""
-    return base64.b64encode(wav_bytes).decode("utf-8")
-
-
-def base64_to_wav_bytes(b64: str) -> bytes:
-    """Decode base64 string back to raw WAV bytes."""
+def base64_to_bytes(b64: str) -> bytes:
+    """Decode base64 string to raw bytes."""
     return base64.b64decode(b64)
 
 
-def cleanup_temp_file(path: str):
-    """Delete temp audio file safely."""
+def bytes_to_base64(data: bytes) -> str:
+    """Encode raw bytes to base64 string for WebSocket JSON."""
+    return base64.b64encode(data).decode("utf-8")
+
+
+def save_to_temp(data: bytes, suffix: str = ".wav") -> str:
+    """Save bytes to a temporary file. Returns path. Caller must delete."""
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.write(data)
+    tmp.close()
+    return tmp.name
+
+
+def cleanup_temp(path: str):
+    """Delete a temp file safely."""
     try:
         if path and os.path.exists(path):
             os.remove(path)
     except Exception as e:
         logger.warning("Could not delete temp file %s: %s", path, e)
+
