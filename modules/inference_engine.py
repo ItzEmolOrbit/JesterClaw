@@ -1,234 +1,177 @@
 """
-JesterClaw — Inference Engine
+JesterClaw — Inference Engine (llama-cpp-python / GGUF)
 Team Lapanic / EmolOrbit
 
-Handles all Qwen2.5-Omni-3B inference:
-  - Text-only conversations (default, fast)
-  - Audio input (voice command)
-  - Image input (vision on demand)
-  - Structured action parsing from model output
+Text-in → Text-out via Qwen2.5-Omni-3B-Q4_K_M GGUF.
+Voice input is transcribed client-side; we receive plain text.
+No TTS — all responses are text.
+
+Action JSON is embedded by the model inside <ACTION>...</ACTION> tags.
 """
 
-import io
 import re
 import json
 import logging
 import asyncio
-import numpy as np
-import soundfile as sf
-from typing import Optional, AsyncIterator
-from threading import Thread
+from typing import AsyncIterator, Optional
 
-import torch
-from transformers import TextIteratorStreamer
-from qwen_omni_utils import process_mm_info
-
-from model_loader import get_model, get_processor
+from model_loader import get_llm
 
 logger = logging.getLogger("jesterclaw.inference")
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are JesterClaw, a Windows AI agent created by Team Lapanic (EmolOrbit).
-You help users accomplish tasks on their Windows computer through conversation or direct action.
+You help users by having natural conversations OR by taking direct actions on their Windows computer.
 
-MODES:
-- If the user is just chatting or asking a question → respond conversationally in plain text.
-- If the user asks you to DO something on their computer (open app, click, scroll, type, take screenshot, control browser, etc.) → respond with a JSON action block AND a brief spoken/text confirmation.
+MODE SELECTION:
+- If the user is chatting, asking a question, or making a statement → reply conversationally.
+- If the user explicitly asks you to DO something on their computer → reply with a brief confirmation AND embed an action block.
 
-ACTION FORMAT (only when needed):
-Wrap computer actions in <ACTION>...</ACTION> tags like this:
-<ACTION>{"action": "open_app", "params": {"app": "notepad"}}</ACTION>
+ACTION FORMAT — only include when the user explicitly requests a computer action:
+<ACTION>{"action": "action_name", "params": {...}}</ACTION>
 
-Available actions and params:
-  open_app        → {"app": "notepad|explorer|chrome|firefox|edge|any_app_name"}
-  click           → {"x": int, "y": int, "button": "left|right|middle"}
-  double_click    → {"x": int, "y": int}
-  right_click     → {"x": int, "y": int}
-  scroll          → {"direction": "up|down|left|right", "amount": int}
-  type_text       → {"text": "...", "slow": false}
-  press_key       → {"key": "enter|escape|tab|win|ctrl+c|alt+f4|..."}
-  move_mouse      → {"x": int, "y": int}
-  screenshot      → {}  (capture screen to see current state)
-  browser_open    → {"url": "https://..."}
-  browser_click   → {"selector": "CSS selector or description"}
-  browser_scroll  → {"direction": "up|down", "amount": int}
-  browser_type    → {"text": "..."}
-  browser_back    → {}
-  browser_close   → {}
-  speak           → {"text": "..."} (say something aloud)
+AVAILABLE ACTIONS:
+  open_app       → {"app": "notepad|explorer|chrome|firefox|edge|cmd|powershell|calculator|paint|<any>"}
+  click          → {"x": 123, "y": 456, "button": "left|right|middle"}
+  double_click   → {"x": 123, "y": 456}
+  right_click    → {"x": 123, "y": 456}
+  scroll         → {"direction": "up|down|left|right", "amount": 3}
+  type_text      → {"text": "hello world", "slow": false}
+  press_key      → {"key": "enter|escape|tab|ctrl+c|alt+f4|win|..."}
+  move_mouse     → {"x": 123, "y": 456}
+  screenshot     → {}
+  browser_open   → {"url": "https://example.com"}
+  browser_click  → {"selector": "button.submit or descriptive label"}
+  browser_scroll → {"direction": "up|down", "amount": 3}
+  browser_type   → {"text": "search query"}
+  browser_back   → {}
+  browser_close  → {}
 
-SAFETY: Never perform destructive actions (format drives, delete system files, disable security) without explicit, confirmed user instruction. When unsure, ask first.
-
-Keep responses short and natural. You are JesterClaw — sharp, quick, reliable.
+IMPORTANT RULES:
+- Use actions ONLY when the user explicitly asks to do something on the computer.
+- Never chain destructive actions (delete files, format drives, disable security software).
+- When unsure about coordinates, use screenshot action first to see the screen.
+- Keep responses short and direct. You are JesterClaw — sharp and fast.
+- Identify yourself as JesterClaw by Team Lapanic / EmolOrbit when asked.
 """
 
 # ── Action extractor ───────────────────────────────────────────────────────────
-ACTION_PATTERN = re.compile(r"<ACTION>(.*?)</ACTION>", re.DOTALL)
+_ACTION_RE = re.compile(r"<ACTION>(.*?)</ACTION>", re.DOTALL)
 
 
 def extract_actions(text: str) -> tuple[str, list[dict]]:
-    """
-    Split model output into (clean_text, list_of_action_dicts).
-    """
+    """Split model output into (clean_text, [action_dicts])."""
     actions = []
-    for match in ACTION_PATTERN.finditer(text):
+    for m in _ACTION_RE.finditer(text):
         try:
-            actions.append(json.loads(match.group(1).strip()))
+            actions.append(json.loads(m.group(1).strip()))
         except json.JSONDecodeError as e:
-            logger.warning("Failed to parse action JSON: %s | raw: %s", e, match.group(1))
+            logger.warning("Bad action JSON: %s | raw: %s", e, m.group(1)[:80])
+    clean = _ACTION_RE.sub("", text).strip()
+    return clean, actions
 
-    clean_text = ACTION_PATTERN.sub("", text).strip()
-    return clean_text, actions
 
-
-# ── Build conversation dict ────────────────────────────────────────────────────
-def build_conversation(
+# ── Build messages list ────────────────────────────────────────────────────────
+def build_messages(
     history: list[dict],
-    user_text: Optional[str] = None,
-    audio_path: Optional[str] = None,
-    image_path: Optional[str] = None,
+    user_text: str,
+    image_b64: Optional[str] = None,  # base64 JPEG from client screenshot
 ) -> list[dict]:
     """
-    Construct the messages list for the model, including history.
+    Construct ChatML message list for llama-cpp-python.
+    If an image is provided, we describe it in text since the GGUF
+    text model may not support vision. The description comes from the
+    client (who sends any relevant screen context as text if needed).
     """
-    messages = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": SYSTEM_PROMPT}],
-        }
-    ]
-
-    # Replay history (already formatted)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
 
-    # Build user turn
-    user_content = []
-    if audio_path:
-        user_content.append({"type": "audio", "audio": audio_path})
-    if image_path:
-        user_content.append({"type": "image", "image": image_path})
-    if user_text:
-        user_content.append({"type": "text", "text": user_text})
-
-    if user_content:
-        messages.append({"role": "user", "content": user_content})
+    # If the client sent a screenshot as context, prepend a note
+    if image_b64:
+        # Attempt multimodal if model supports it, else add a text note
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": user_text},
+            ]
+        })
+    else:
+        messages.append({"role": "user", "content": user_text})
 
     return messages
 
 
-# ── Streaming text inference ───────────────────────────────────────────────────
+# ── Streaming inference ────────────────────────────────────────────────────────
 async def stream_inference(
     history: list[dict],
-    user_text: Optional[str] = None,
-    audio_path: Optional[str] = None,
-    image_path: Optional[str] = None,
+    user_text: str,
+    image_b64: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """
-    Yields text tokens as they are generated (streaming).
-    Last yield is a special sentinel: "__DONE__:{full_text}"
+    Yields text tokens as they stream out of llama-cpp-python.
+    Final yield is "__DONE__:<full_text>".
+
+    Runs the synchronous llama-cpp generate in a thread executor
+    so the async event loop stays unblocked.
     """
-    model = get_model()
-    processor = get_processor()
+    llm = get_llm()
+    messages = build_messages(history, user_text, image_b64)
     loop = asyncio.get_event_loop()
 
-    conversation = build_conversation(history, user_text, audio_path, image_path)
+    # llama-cpp-python streaming returns a generator — we consume it in a thread
+    token_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
-    # Prepare inputs in executor to avoid blocking the event loop
-    def _prepare():
-        text_prompt = processor.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False
-        )
-        audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
-        inputs = processor(
-            text=text_prompt,
-            audio=audios if audios else None,
-            images=images if images else None,
-            videos=None,
-            return_tensors="pt",
-            padding=True,
-        )
-        return inputs.to(model.device).to(model.dtype)
+    def _run():
+        try:
+            stream = llm.create_chat_completion(
+                messages=messages,
+                max_tokens=1024,
+                temperature=0.7,
+                top_p=0.9,
+                stream=True,
+                stop=["</ACTION>"],   # don't stop mid-action
+            )
+            for chunk in stream:
+                delta = chunk["choices"][0]["delta"].get("content", "")
+                if delta:
+                    loop.call_soon_threadsafe(token_queue.put_nowait, delta)
+        except Exception as e:
+            logger.error("Inference error: %s", e)
+            loop.call_soon_threadsafe(token_queue.put_nowait, f"\n[Error: {e}]")
+        finally:
+            loop.call_soon_threadsafe(token_queue.put_nowait, None)  # done sentinel
 
-    inputs = await loop.run_in_executor(None, _prepare)
-
-    streamer = TextIteratorStreamer(
-        processor.tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=True,
-    )
-
-    gen_kwargs = dict(
-        **inputs,
-        streamer=streamer,
-        max_new_tokens=1024,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-        return_audio=False,  # text-only streaming; TTS handled separately
-    )
-
-    # Run generation in a background thread
-    thread = Thread(target=model.generate, kwargs=gen_kwargs, daemon=True)
-    thread.start()
+    # Run in thread so we don't block the event loop
+    loop.run_in_executor(None, _run)
 
     full_text = []
-    queue: asyncio.Queue[str] = asyncio.Queue()
-
-    def _enqueue():
-        for token in streamer:
-            loop.call_soon_threadsafe(queue.put_nowait, token)
-        loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
-
-    enqueue_thread = Thread(target=_enqueue, daemon=True)
-    enqueue_thread.start()
-
     while True:
-        token = await queue.get()
+        token = await token_queue.get()
         if token is None:
             break
         full_text.append(token)
-        yield token
+        yield token   # stream each token to client immediately
 
-    thread.join()
     yield f"__DONE__:{''.join(full_text)}"
 
 
-# ── TTS: generate audio from text ─────────────────────────────────────────────
-async def text_to_speech_bytes(text: str) -> Optional[bytes]:
-    """
-    Use Qwen2.5-Omni's built-in TTS to convert text → WAV bytes.
-    Returns None if TTS fails.
-    """
-    model = get_model()
-    processor = get_processor()
+# ── Single-shot inference (for internal use) ────────────────────────────────────
+async def infer_once(prompt: str, max_tokens: int = 256) -> str:
+    """Non-streaming single inference call."""
+    llm = get_llm()
     loop = asyncio.get_event_loop()
 
-    conversation = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": "You are JesterClaw, a Windows AI assistant. Speak the following text naturally."}],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": f"Say: {text}"}],
-        },
-    ]
-
-    def _run_tts():
-        text_prompt = processor.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False
+    def _run():
+        resp = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.5,
+            stream=False,
         )
-        inputs = processor(text=text_prompt, return_tensors="pt", padding=True)
-        inputs = inputs.to(model.device).to(model.dtype)
-        with torch.no_grad():
-            text_ids, audio = model.generate(**inputs, max_new_tokens=512, return_audio=True)
-        buf = io.BytesIO()
-        sf.write(buf, audio.reshape(-1).cpu().float().numpy(), samplerate=24000, format="WAV")
-        return buf.getvalue()
+        return resp["choices"][0]["message"]["content"]
 
-    try:
-        wav_bytes = await loop.run_in_executor(None, _run_tts)
-        return wav_bytes
-    except Exception as e:
-        logger.error("TTS generation failed: %s", e)
-        return None
+    return await loop.run_in_executor(None, _run)
